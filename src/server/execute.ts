@@ -24,12 +24,17 @@ import type {
   UsageSummary,
 } from "@paperclipai/adapter-utils";
 
+import os from "node:os";
+
 import {
   runChildProcess,
   buildPaperclipEnv,
   renderTemplate,
   ensureAbsoluteDirectory,
 } from "@paperclipai/adapter-utils/server-utils";
+
+import { readFile, writeFile, mkdir, copyFile, readdir, stat } from "node:fs/promises";
+import { join } from "node:path";
 
 import {
   HERMES_CLI,
@@ -306,6 +311,112 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
 }
 
 // ---------------------------------------------------------------------------
+// Auto-provisioning: ensure agent Hermes home exists with proper isolation
+// ---------------------------------------------------------------------------
+
+const HERMES_TEMPLATE_HOME = join(os.homedir(), ".hermes");
+
+interface ProvisionResult {
+  hermesHome: string;
+  workspace: string;
+  wasNewlyProvisioned: boolean;
+}
+
+/**
+ * Ensure an isolated Hermes home exists for the given agent.
+ * If HERMES_HOME is already set in config.env, verify it exists.
+ * Otherwise, check for an existing hermes home or provision from template.
+ *
+ * Returns the hermesHome path and whether we newly provisioned it.
+ */
+async function provisionAgentHermesHome(
+  agentId: string,
+  companyId: string,
+  env: Record<string, string>,
+): Promise<ProvisionResult> {
+  // If HERMES_HOME is already set and exists, use it
+  if (env.HERMES_HOME) {
+    try {
+      const hermesStat = await stat(env.HERMES_HOME);
+      if (hermesStat.isDirectory()) {
+        return {
+          hermesHome: env.HERMES_HOME,
+          workspace: env.PAPERCLIP_WORKSPACE_CWD || env.HERMES_HOME,
+          wasNewlyProvisioned: false,
+        };
+      }
+    } catch {
+      // Path doesn't exist — will be provisioned below
+    }
+  }
+
+  // Determine base path for agent homes
+  const baseDir = process.env.PAPERCLIP_AGENT_HOMES_BASE ||
+    join(process.env.HOME || os.homedir(), ".paperclip", "agent-homes");
+
+  const hermesHome = join(baseDir, "companies", companyId, "agents", agentId, ".hermes");
+  const workspace = join(baseDir, "workspaces", companyId, agentId);
+
+  // Check if already provisioned
+  try {
+    const existingHermes = await stat(hermesHome);
+    if (existingHermes.isDirectory()) {
+      return { hermesHome, workspace, wasNewlyProvisioned: false };
+    }
+  } catch {
+    // Doesn't exist yet — provision from template
+  }
+
+  // Provision from template
+  try {
+    await mkdir(hermesHome, { recursive: true });
+
+    // Copy template files if template exists
+    try {
+      const templateFiles = ["config.yaml", "auth.json", "SOUL.md", ".env"] as const;
+      for (const file of templateFiles) {
+        const src = join(HERMES_TEMPLATE_HOME, file);
+        try {
+          await copyFile(src, join(hermesHome, file));
+        } catch {
+          // File doesn't exist in template — that's OK
+        }
+      }
+    } catch {
+      // Template copy failed — continue with empty directory
+    }
+
+    // Ensure required subdirectories exist
+    const subdirs = ["memories", "sessions", "logs", "cache", "mnemosyne/data", "skills", "hooks", "plugins"];
+    for (const subdir of subdirs) {
+      await mkdir(join(hermesHome, subdir), { recursive: true });
+    }
+
+    // Set ownership/permissions if running as root
+    try {
+      const { exec } = await import("node:child_process");
+      await new Promise<void>((resolve, reject) => {
+        exec(`chmod -R 755 "${hermesHome}"`, (err) => {
+          if (err) resolve(); // chmod failure is non-fatal
+          else resolve();
+        });
+      });
+    } catch {
+      // chown failure is non-fatal
+    }
+
+    return { hermesHome, workspace, wasNewlyProvisioned: true };
+  } catch (err) {
+    // Provisioning failed — fall back to template Hermes home
+    return {
+      hermesHome: HERMES_TEMPLATE_HOME,
+      workspace: HERMES_TEMPLATE_HOME,
+      wasNewlyProvisioned: false,
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main execute
 // ---------------------------------------------------------------------------
 
@@ -325,6 +436,28 @@ export async function execute(
   const persistSession = cfgBoolean(config.persistSession) !== false;
   const worktreeMode = cfgBoolean(config.worktreeMode) === true;
   const checkpoints = cfgBoolean(config.checkpoints) === true;
+
+  // ── Auto-provision isolated Hermes home if needed ─────────────────────
+  // Only if HERMES_HOME not explicitly set in config.env
+  const configEnv = config.env as Record<string, string> | undefined;
+  const hasExplicitHermesHome = configEnv?.HERMES_HOME && configEnv.HERMES_HOME.length > 0;
+  if (!hasExplicitHermesHome && ctx.agent?.id && ctx.agent?.companyId) {
+    const envForProvisioning: Record<string, string> = {
+      ...(process.env as Record<string, string>),
+      ...buildPaperclipEnv(ctx.agent),
+    };
+    if (configEnv) {
+      Object.assign(envForProvisioning, configEnv);
+    }
+    const provisionResult = await provisionAgentHermesHome(
+      ctx.agent.id,
+      ctx.agent.companyId,
+      envForProvisioning,
+    );
+    if (provisionResult.wasNewlyProvisioned) {
+      await ctx.onLog("stdout", `[hermes] Provisioned isolated Hermes home: ${provisionResult.hermesHome}\n`);
+    }
+  }
 
   // ── Resolve provider (defense in depth) ────────────────────────────────
   // Priority chain:
@@ -420,9 +553,14 @@ export async function execute(
   const taskId = cfgString(ctx.config?.taskId);
   if (taskId) env.PAPERCLIP_TASK_ID = taskId;
 
-  const userEnv = config.env as Record<string, string> | undefined;
-  if (userEnv && typeof userEnv === "object") {
-    Object.assign(env, userEnv);
+  const configEnvRaw = config.env as Record<string, string> | undefined;
+  if (configEnvRaw && typeof configEnvRaw === "object") {
+    // Pass HERMES_HOME if configured — this scopes Hermes state to the
+    // agent's isolated home directory (memories, sessions, mnemosyne, etc.)
+    if (configEnvRaw.HERMES_HOME) {
+      env.HERMES_HOME = configEnvRaw.HERMES_HOME;
+    }
+    Object.assign(env, configEnvRaw);
   }
 
   // ── Resolve working directory ──────────────────────────────────────────

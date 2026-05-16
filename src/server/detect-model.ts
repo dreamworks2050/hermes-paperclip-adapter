@@ -120,13 +120,18 @@ export function inferProviderFromModel(model: string): string | undefined {
  * Resolve the correct provider for a model, using a priority chain:
  *
  *   1. Explicit provider from adapterConfig (highest priority — user override)
- *   2. Provider from Hermes config file — ONLY if the config model matches
- *      the requested model (otherwise the config provider is for a different model)
+ *   2. Provider from Hermes config file — but ONLY if it's a valid CLI provider
+ *      OR if the config model matches the requested model (for alias resolution)
  *   3. Provider inferred from model name prefix
  *   4. "auto" (let Hermes figure it out — lowest priority)
  *
  * Always returns a valid provider string.
  * The `resolvedFrom` field indicates which source was used, useful for logging.
+ *
+ * Note: Hermes supports provider aliases in config.yaml (e.g., "minimax-oauth")
+ * that are not valid --provider CLI flag values. When the detected provider is
+ * not a valid CLI provider but is valid in Hermes config, we pass "auto" so
+ * Hermes can resolve the alias internally.
  */
 export function resolveProvider(options: {
   /** Explicit provider from adapterConfig (user override) */
@@ -145,17 +150,26 @@ export function resolveProvider(options: {
     return { provider: explicitProvider, resolvedFrom: "adapterConfig" };
   }
 
-  // 2. Provider from Hermes config file — but ONLY if the config model matches
-  //    the requested model. Otherwise the config provider is for a different model
-  //    and would cause exactly the kind of routing bug we're fixing.
-  if (
-    detectedProvider &&
-    detectedModel &&
-    (VALID_PROVIDERS as readonly string[]).includes(detectedProvider) &&
-    // Config model matches requested model (exact or case-insensitive)
-    detectedModel.toLowerCase() === model?.toLowerCase()
-  ) {
-    return { provider: detectedProvider, resolvedFrom: "hermesConfig" };
+  // 2. Provider from Hermes config file
+  //    If it's a valid CLI provider AND the config model matches the requested model,
+  //    use it directly. If it's NOT a valid CLI provider (e.g., "minimax-oauth")
+  //    but the model matches, fall back to "auto" so Hermes resolves the alias.
+  if (detectedProvider && detectedModel) {
+    const configModelMatches = detectedModel.toLowerCase() === model?.toLowerCase();
+    if (configModelMatches) {
+      if ((VALID_PROVIDERS as readonly string[]).includes(detectedProvider)) {
+        return { provider: detectedProvider, resolvedFrom: "hermesConfig" };
+      }
+      // Provider is not a valid CLI flag but is valid in Hermes config (alias).
+      // Fall back to "auto" — Hermes will resolve the alias from config.yaml.
+      if (model) {
+        const inferred = inferProviderFromModel(model);
+        if (inferred) {
+          return { provider: inferred, resolvedFrom: "modelInference" };
+        }
+      }
+      return { provider: "auto", resolvedFrom: "hermesConfigAlias" };
+    }
   }
 
   // 3. Infer from model name prefix

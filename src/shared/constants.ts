@@ -23,6 +23,11 @@ export const DEFAULT_MODEL = "anthropic/claude-sonnet-4";
 /**
  * Valid --provider choices for the hermes CLI.
  * Must stay in sync with `hermes chat --help`.
+ *
+ * Note: hermes-agent supports provider aliases like "minimax-oauth" in config.yaml,
+ * but the CLI only accepts the base provider name via --provider flag.
+ * When a detected provider is not in this list, we fall back to "auto"
+ * so Hermes can use its configured alias from config.yaml.
  */
 export const VALID_PROVIDERS = [
   "auto",
