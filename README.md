@@ -1,8 +1,8 @@
 # Paperclip Adapter for Hermes Agent
 
-A [Paperclip](https://paperclip.ing) adapter that lets you run [Hermes Agent](https://github.com/NousResearch/hermes-agent) as a managed employee in a Paperclip company.
+A [Paperclip](https://paperclip.ing) adapter that provisions and manages **independent, isolated Hermes Agent instances** — each with their own state, memory, sessions, and workspace. The adapter handles the complete agent lifecycle: creation, provisioning, execution, session continuity, and cleanup. Any agent in a Paperclip company can programmatically create new Hermes agents on demand through the standard Paperclip API, and the adapter takes care of the rest.
 
-Hermes Agent is a full-featured AI agent by [Nous Research](https://nousresearch.com) with 30+ native tools, persistent memory, session persistence, 80+ skills, MCP support, and multi-provider model access.
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) by [Nous Research](https://nousresearch.com) is a full-featured AI agent with 30+ native tools, persistent memory, session persistence, 80+ skills, MCP support, and multi-provider model access.
 
 ## Key Features
 
@@ -32,6 +32,62 @@ This adapter provides:
 | Context compression | ❌ | ❌ | ✅ Auto-compresses long conversations |
 | MCP client | ❌ | ❌ | ✅ Connect to any MCP server |
 | Multi-provider | Anthropic only | OpenAI only | ✅ 8 providers out of the box |
+| Independent lifecycle | ❌ | ❌ | ✅ Isolated homes, auto-provisioning, cleanup |
+
+## Independent Agent Lifecycle
+
+This adapter manages **independent, isolated Hermes agents** whose full lifecycle is owned by the adapter. Each agent runs with its own state — there is no shared state between agents. Every aspect of the lifecycle is handled automatically:
+
+### Isolation & Provisioning
+
+Each agent gets its own isolated Hermes home directory at:
+
+```
+/home/paperclip/data/companies/{companyId}/agents/{agentId}/.hermes/
+```
+
+This directory contains all agent state:
+- **memories/** — persistent memory across sessions
+- **sessions/** — conversation history (resumable across heartbeats)
+- **skills/** — Hermes-native skills
+- **config.yaml** — model and provider settings
+- **auth.json** — API credentials
+- **SOUL.md** — agent persona
+
+New agents are provisioned automatically on first heartbeat via the `onHireApproved` hook, which creates the isolated home directory and copies the template from `~/.hermes/`.
+
+### Session Continuity
+
+Agents maintain conversation context across Paperclip heartbeats using Hermes's `--resume` flag. Each run picks up where the last one left off — preserving memories, tool state, and pending work. The `sessionCodec` validates and migrates session state between runs.
+
+### Automatic Cleanup
+
+When an agent is removed from Paperclip, its isolated Hermes home and workspace are automatically cleaned up on the next execute run. No orphaned state accumulates.
+
+### Programmatic Agent Creation
+
+**Any Hermes agent (or any other Paperclip agent) can create new Hermes agents on demand** via the standard Paperclip API:
+
+```bash
+curl -s -X POST "{{paperclipApiUrl}}/companies/{{companyId}}/agent-hires" \
+  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "My New Agent",
+    "adapterType": "hermes_local",
+    "adapterConfig": {
+      "model": "MiniMax-M2.7-highspeed",
+      "timeoutSec": 300,
+      "persistSession": true
+    },
+    "role": "engineer",
+    "title": "Software Engineer"
+  }'
+```
+
+The adapter provisions the new agent's isolated Hermes home immediately, making it ready to receive work on its next heartbeat.
+
+> **Valid roles for new agents:** `ceo`, `cto`, `cmo`, `cfo`, `security`, `engineer`, `designer`, `pm`, `qa`, `devops`, `researcher`, `general`
 
 ## Installation
 
@@ -164,22 +220,38 @@ Conditional sections:
 - `{{#noTask}}...{{/noTask}}` — included only when no task (heartbeat check)
 - `{{#commentId}}...{{/commentId}}` — included only when woken by a comment
 
-## Architecture
+```mermaid
+flowchart TB
+    PC["**Paperclip Server**\nHeartbeat · Issues · Agent Registry"]
 
-```
-Paperclip                          Hermes Agent
-┌──────────────────┐               ┌──────────────────┐
-│  Heartbeat       │               │                  │
-│  Scheduler       │───execute()──▶│  hermes chat -q  │
-│                  │               │                  │
-│  Issue System    │               │  30+ Tools       │
-│  Comment Wakes   │◀──results─────│  Memory System   │
-│                  │               │  Session DB      │
-│  Cost Tracking   │               │  Skills          │
-│                  │               │  MCP Client      │
-│  Skill Sync      │◀──snapshot────│  ~/.hermes/skills│
-│  Org Chart       │               │                  │
-└──────────────────┘               └──────────────────┘
+    subgraph Agents["Independent Hermes Agents"]
+        A1["Hermes Agent A\n Own .hermes/"]
+        A2["Hermes Agent B\n Own .hermes/"]
+        AN["Hermes Agent N\n Own .hermes/"]
+    end
+
+    subgraph Homes["Isolated Hermes Homes"]
+        H1[".hermes/\n mem · sessions · skills · config"]
+        H2[".hermes/\n mem · sessions · skills · config"]
+        HN[".hermes/\n mem · sessions · skills · config"]
+    end
+
+    PC -->|"onHireApproved → provision"| A1
+    PC -->|"onHireApproved → provision"| A2
+    PC -->|"onHireApproved → provision"| AN
+
+    A1 -.->|"POST /agent-hires\ncreates new agent"| PC
+    A2 -.->|"POST /agent-hires\ncreates new agent"| PC
+
+    A1 --> H1
+    A2 --> H2
+    AN --> HN
+
+    PC -->|"execute(agentId) → isolated HERMES_HOME"| A1
+    PC -->|"execute(agentId) → isolated HERMES_HOME"| A2
+
+    A1 -.->|"--resume sessionId"| H1
+    A2 -.->|"--resume sessionId"| H2
 ```
 
 The adapter spawns Hermes Agent's CLI in single-query mode (`-q`). Hermes
